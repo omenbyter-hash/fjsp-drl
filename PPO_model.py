@@ -151,7 +151,10 @@ class HGNNScheduler(nn.Module):
         raise NotImplementedError
 
     def feature_normalize(self, data):
-        return (data - torch.mean(data)) / ((data.std() + 1e-5))
+        std = data.std()
+        if std < 1e-4:
+            return torch.zeros_like(data)
+        return (data - torch.mean(data)) / std
 
     '''
         raw_opes: shape: [len(batch_idxes), max(num_opes), in_size_ope]
@@ -402,7 +405,9 @@ class PPO:
                 rewards.insert(0, discounted_reward)
             discounted_rewards += discounted_reward
             rewards = torch.tensor(rewards, dtype=torch.float64).to(device)
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
+            rewards_std = rewards.std()
+            if rewards_std > 1e-4:
+                rewards = (rewards - rewards.mean()) / rewards_std
             rewards_envs.append(rewards)
         rewards_envs = torch.cat(rewards_envs)
 
@@ -429,17 +434,28 @@ class PPO:
                                          old_eligible[start_idx: end_idx, :, :],
                                          old_action_envs[start_idx: end_idx])
 
-                ratios = torch.exp(logprobs - old_logprobs[i*minibatch_size:(i+1)*minibatch_size].detach())
-                advantages = rewards_envs[i*minibatch_size:(i+1)*minibatch_size] - state_values.detach()
+                ratios = torch.exp(logprobs - old_logprobs[start_idx:end_idx].detach())
+                
+                # Clamp ratios to prevent extreme values
+                ratios = torch.clamp(ratios, 0.01, 100.0)
+
+                advantages = rewards_envs[start_idx:end_idx] - state_values.detach()
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
                 loss = - self.A_coeff * torch.min(surr1, surr2)\
-                       + self.vf_coeff * self.MseLoss(state_values, rewards_envs[i*minibatch_size:(i+1)*minibatch_size])\
+                       + self.vf_coeff * self.MseLoss(state_values, rewards_envs[start_idx:end_idx])\
                        - self.entropy_coeff * dist_entropy
+                
+                # Check for NaN
+                if torch.isnan(loss).any():
+                    print("Warning: NaN detected in loss, skipping this batch")
+                    continue
+
                 loss_epochs += loss.mean().detach()
 
                 self.optimizer.zero_grad()
                 loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
                 self.optimizer.step()
 
         # Copy new weights into old policy:
